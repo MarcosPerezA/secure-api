@@ -1,32 +1,33 @@
 ﻿using System.Text;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using SecureApi.Data;
-using SecureApi.Security;                  // <- middlewares de seguridad
-using Microsoft.AspNetCore.RateLimiting;   // <- rate limiting (opcional)
+using SecureApi.Security;
 using System.Threading.RateLimiting;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// ======================= SERVICES =======================
+// ======================================
+// 1) SERVICES
+// ======================================
 
-// DbContext (SQL Server)
+// DbContext (SQL Azure)
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlServer(builder.Configuration.GetConnectionString("Default")));
 
-// Hash de contraseñas (BCrypt)
+// (Opcional) Servicio de contraseñas si lo usas
 builder.Services.AddScoped<IPasswordService, PasswordService>();
 
-// Controllers + Swagger con esquema de seguridad Bearer
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
+
+// Swagger + esquema de seguridad Bearer
 builder.Services.AddSwaggerGen(options =>
 {
     options.SwaggerDoc("v1", new OpenApiInfo { Title = "Secure API", Version = "v1" });
-
-    // Seguridad Bearer en Swagger
     options.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
         Name = "Authorization",
@@ -48,9 +49,12 @@ builder.Services.AddSwaggerGen(options =>
     });
 });
 
-// JWT: validación estricta
+// JWT inline (lee Jwt:* desde Variables de entorno / appsettings)
 var jwt = builder.Configuration.GetSection("Jwt");
-var keyBytes = Encoding.UTF8.GetBytes(jwt["Key"]!);
+var key = jwt["Key"] ?? throw new InvalidOperationException("Jwt:Key no configurado");
+var issuer = jwt["Issuer"];
+var audience = jwt["Audience"];
+var keyBytes = Encoding.UTF8.GetBytes(key);
 
 builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
     .AddJwtBearer(opt =>
@@ -62,66 +66,67 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateIssuerSigningKey = true,
             ValidateLifetime = true,
             ClockSkew = TimeSpan.FromMinutes(1),
-            ValidIssuer = jwt["Issuer"],
-            ValidAudience = jwt["Audience"],
+            ValidIssuer = issuer,
+            ValidAudience = audience,
             IssuerSigningKey = new SymmetricSecurityKey(keyBytes)
         };
-        opt.SaveToken = false;
-        // opt.RequireHttpsMetadata = true; // Actívalo en producción con HTTPS real
     });
 
 builder.Services.AddAuthorization();
 
-// CORS afinado (solo FE local)
+// CORS (agrega aquí tu SWA cuando lo tengas)
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("ng", policy =>
-        policy.WithOrigins("http://localhost:4200")
+        policy.WithOrigins("http://localhost:4200") // + "https://<tu-swa>.azurestaticapps.net"
               .AllowAnyHeader()
               .AllowAnyMethod());
 });
 
-// Rate limiting (opcional) — usamos en /auth/login
+// Rate limiting opcional para /auth/login
 builder.Services.AddRateLimiter(_ => _
     .AddFixedWindowLimiter("loginLimiter", options =>
     {
         options.Window = TimeSpan.FromMinutes(1);
-        options.PermitLimit = 10; // 10 intentos/min por IP
+        options.PermitLimit = 10;
         options.QueueProcessingOrder = QueueProcessingOrder.OldestFirst;
         options.QueueLimit = 0;
     }));
 
-// ======================= APP PIPELINE =======================
-
+// ======================================
+// 2) APP PIPELINE
+// ======================================
 var app = builder.Build();
 
-// Manejo global de errores (debe ir lo más arriba posible)
+// Manejo global de errores primero
 app.UseGlobalErrorHandler();
 
-if (app.Environment.IsDevelopment())
+// Swagger SIEMPRE (útil para demo en Azure)
+app.UseSwagger();
+app.UseSwaggerUI(c =>
 {
-    app.UseSwagger();
-    app.UseSwaggerUI();
-}
-else
+    c.SwaggerEndpoint("/swagger/v1/swagger.json", "Secure API v1");
+    c.RoutePrefix = "swagger";
+});
+
+if (!app.Environment.IsDevelopment())
 {
-    // HSTS solo en no-desarrollo
     app.UseHsts();
 }
 
 app.UseHttpsRedirection();
 
-// Encabezados de seguridad
+// Headers de seguridad
 app.UseSecurityHeaders();
 
 // CORS
 app.UseCors("ng");
 
-// AuthN/AuthZ
+// Auth
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Rate limiting (si lo usas en /auth/login)
+// Rate limiter (si lo usas en el AuthController)
 app.UseRateLimiter();
 
 app.MapControllers();
